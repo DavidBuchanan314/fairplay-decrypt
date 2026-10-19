@@ -1,0 +1,36 @@
+# Python and local build products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.DS_Store
+/transform
+
+# Generated runs contain account- and device-specific material.
+runs/
+
+# Credentials, device identifiers, and retrieval checkpoints anywhere in the tree.
+credential*.bin
+*.sidb
+*.sinf
+uid*.bin
+request*.bin
+source16.bin
+hardware-result.bin
+manifest.json
+device-udid*
+device-ecid*
+*pairing-record*
+
+# Authorized input and decrypted output packages.
+*.ipa
+
+# Other common local secrets and diagnostic captures.
+.env
+.env.*
+*.pem
+*.p12
+*.key
+*.log
