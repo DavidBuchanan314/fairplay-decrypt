@@ -9,7 +9,7 @@ Decryption runs on macOS and Linux.
 
 Supports version-3 and version-5 SUPF, 448-byte and 440-byte SINF `priv`
 records, and encrypted arm64 Mach-O slices. A 440-byte record must end in
-eight zero bytes. The iOS 26+ license format is not supported.
+eight zero bytes.
 
 ## Set up
 
