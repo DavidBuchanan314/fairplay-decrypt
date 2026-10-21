@@ -1,433 +1,266 @@
 #!/usr/bin/env python3
-"""Retrieve an account credential on a supported 18G82 device."""
+"""Run the native credential retriever on a jailbroken device over USB SSH."""
+
+from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 from pathlib import Path
+import plistlib
 import re
-import secrets
+import select
+import shlex
 import subprocess
-import sys
+import time
 from zipfile import ZipFile
 
+from native_ssh import SSHDevice
+
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT.parent))
-
-from core import derive_work16  # noqa: E402
-from offline import (
-    aes__core_decrypt,
-    core3__derive,
-    hardware__derive,
-    priv_transform__atom,
-    tail__final_pass,
-    tail__first_pass,
-    tail__table_from_static_init,
-    tail__table_pass,
-)  # noqa: E402
-
-BUILD_ASSETS = {
-    "fairplayd.A2.ios14": "30469ad8d24c232c277af6ce5a794b1fb36b4f25543b642be331d3b3f6b5d411",
-    "static-key-table.bin": "c7b33507f71d5f7a07f623eb21f6b9f23997f950119371631f6535f63e6d2af1",
-    "helper.ios14": "6e8872ac1dfefe66f761fd70f9f22aced398c1f42ae11bdd7eaaefcbf5c442b3",
-}
-CONTEXT_RE = re.compile(r"^keybag-output-first16=([0-9a-f]{32})$", re.MULTILINE)
-SUPPORTED_BUILD = "18G82"
-DEVICE_SIDB = "/private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sidb"
-SLOT_IN_PAGE = 0x14F0
-BODY_FROM_SLOT = 0x180
-MAX_LICENSE_BYTES = 1 << 20
-
-
-class CommandFailure(RuntimeError):
-    def __init__(self, code: int, output: str):
-        super().__init__(f"subprocess exited {code}")
-        self.code = code
-        self.output = output
-
-
-def digest(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def write_new(path: Path, data: bytes) -> None:
-    with os.fdopen(
-        os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
-    ) as stream:
-        stream.write(data)
-
-
-def run(command: list[str], env: dict[str, str], *, compact: bool = False) -> str:
-    completed = subprocess.run(command, env=env, capture_output=True, text=True)
-    output = completed.stdout + completed.stderr
-    lines = output.splitlines()
-    print("running:", " ".join(command), flush=True)
-    print(
-        "\n".join(
-            lines[:1] + lines[-2:]
-            if compact and completed.returncode == 0 and len(lines) > 3
-            else lines
-        ),
-        flush=True,
-    )
-    if completed.returncode:
-        raise CommandFailure(completed.returncode, output)
-    return output
-
-
-def preflight() -> None:
-    for filename, expected in BUILD_ASSETS.items():
-        if digest((ROOT / filename).read_bytes()) != expected:
-            raise ValueError(f"missing or altered 18G82 asset: {filename}")
+BUNDLE = ROOT / "build" / "bundle"
+DEVICE_FILES = ("credential.ios", "selector21.ios", "trigger.ios", "static-key-table.bin", "core4-word-table.bin")
+MAX_SINF_BYTES = 1 << 20
 
 
 def connected_udid() -> str:
-    devices = subprocess.run(
-        ["idevice_id", "-l"], capture_output=True, text=True, check=True, timeout=10
-    ).stdout.splitlines()
+    devices = subprocess.run(["idevice_id", "-l"], capture_output=True, text=True, check=True, timeout=10).stdout.splitlines()
     if len(devices) != 1:
-        raise RuntimeError(
-            f"connect exactly one supported device; found {len(devices)}"
-        )
+        raise RuntimeError(f"connect exactly one device; found {len(devices)}")
     return normalize_udid(devices[0])
 
 
 def normalize_udid(value: str) -> str:
     value = value.strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", value):
-        raise ValueError("device UDID must contain exactly 40 hexadecimal digits")
+        raise ValueError("device UDID must contain 40 hexadecimal digits")
     return value
 
 
-def check_build(udid: str) -> str:
-    def info(key: str) -> str:
-        return subprocess.run(
-            ["ideviceinfo", "-u", udid, "-k", key],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        ).stdout.strip()
-
-    build = info("BuildVersion")
-    if build != SUPPORTED_BUILD:
-        raise ValueError(f"unsupported device build {build!r}; need {SUPPORTED_BUILD}")
-    return info("ProductType")
+def children(data: bytes, start: int, end: int):
+    at = start
+    while at < end:
+        if at + 8 > end:
+            raise ValueError("truncated SINF atom")
+        size = int.from_bytes(data[at : at + 4], "big")
+        if size < 8 or at + size > end:
+            raise ValueError("invalid SINF atom size")
+        yield data[at + 4 : at + 8], at + 8, at + size
+        at += size
 
 
-def read_device_sidb(udid: str, path: str) -> bytes:
-    import frida
-    from device_call import download
+def sinf_field(sinf: bytes, tag: bytes) -> bytes:
+    root = list(children(sinf, 0, len(sinf)))
+    if len(root) != 1 or root[0][0] != b"sinf":
+        raise ValueError("expected one complete SINF atom")
+    schi = [item for item in children(sinf, root[0][1], root[0][2]) if item[0] == b"schi"]
+    if len(schi) != 1:
+        raise ValueError("expected one SINF schi container")
+    fields = [item for item in children(sinf, schi[0][1], schi[0][2]) if item[0] == tag]
+    if len(fields) != 1:
+        raise ValueError(f"expected one SINF {tag!r} field")
+    return sinf[fields[0][1] : fields[0][2]]
 
-    device = frida.get_usb_device(timeout=10)
-    if device.id.lower() != udid:
-        raise ValueError("Frida selected a different USB device")
-    return download(device, path)
+
+def supported_sinf(sinf: bytes) -> bool:
+    try:
+        priv = sinf_field(sinf, b"priv")
+        sinf_field(sinf, b"name")
+        return len(sinf_field(sinf, b"user")) == 4 and len(sinf_field(sinf, b"key ")) == 4 and len(sinf_field(sinf, b"iviv")) == 16 and (len(priv) == 448 or (len(priv) == 440 and priv[-8:] == bytes(8)))
+    except ValueError:
+        return False
 
 
-def license_sinf(
-    raw_path: Path | None, ipa_path: Path | None, member: str | None
-) -> tuple[bytes, str]:
+def license_sinf(raw_path: Path | None, ipa_path: Path | None, member: str | None) -> bytes:
     if raw_path is not None:
         if member:
             raise ValueError("--sinf-member requires --ipa")
-        if raw_path.stat().st_size > MAX_LICENSE_BYTES:
-            raise ValueError("license SINF is unreasonably large")
+        if raw_path.stat().st_size > MAX_SINF_BYTES:
+            raise ValueError("SINF is too large")
         sinf = raw_path.read_bytes()
-        label = raw_path.name
     else:
         if ipa_path is None:
             raise ValueError("supply --sinf or --ipa")
         with ZipFile(ipa_path) as archive:
-            members = sorted(
-                name
-                for name in archive.namelist()
-                if "/SC_Info/" in name
-                and name.endswith(".sinf")
-                and not name.endswith(".v4.sinf")
-            )
+            names = sorted(name for name in archive.namelist() if "/SC_Info/" in name and name.endswith(".sinf") and not name.endswith(".v4.sinf"))
             if member:
-                if member not in members:
-                    raise ValueError("--sinf-member is not a supported SINF in the IPA")
-                if archive.getinfo(member).file_size > MAX_LICENSE_BYTES:
-                    raise ValueError("license SINF is unreasonably large")
-                label = member
-                sinf = archive.read(member)
-            else:
-                by_key: dict[tuple[bytes, bytes], list[tuple[str, bytes]]] = {}
-                for name in members:
-                    if archive.getinfo(name).file_size > MAX_LICENSE_BYTES:
+                if member not in names:
+                    raise ValueError("--sinf-member is not a supported SINF")
+                names = [member]
+            selectors = {}
+            for name in names:
+                if archive.getinfo(name).file_size > MAX_SINF_BYTES:
+                    continue
+                candidate = archive.read(name)
+                try:
+                    if not supported_sinf(candidate):
                         continue
-                    data = archive.read(name)
-                    try:
-                        key = (
-                            priv_transform__atom(data, b"user"),
-                            priv_transform__atom(data, b"key "),
-                        )
-                    except ValueError:
-                        continue
-                    by_key.setdefault(key, []).append((name, data))
-                if len(by_key) != 1:
-                    raise ValueError(
-                        f"IPA has {len(by_key)} distinct license selectors; "
-                        "choose one with --sinf-member"
-                    )
-                choices = next(iter(by_key.values()))
-                label, sinf = min(
-                    choices, key=lambda item: (item[0].count("/"), item[0])
-                )
-    if (
-        len(sinf) < 8
-        or sinf[4:8] != b"sinf"
-        or int.from_bytes(sinf[:4], "big") != len(sinf)
-    ):
-        raise ValueError("input is not one complete SINF atom")
-    return sinf, label
+                    selector = (sinf_field(candidate, b"user"), sinf_field(candidate, b"key "))
+                except ValueError:
+                    continue
+                selectors.setdefault(selector, []).append((name, candidate))
+            if len(selectors) != 1:
+                raise ValueError(f"IPA has {len(selectors)} distinct license selectors; choose one with --sinf-member")
+            sinf = min(next(iter(selectors.values())), key=lambda item: (item[0].count("/"), item[0]))[1]
+    if len(sinf) > MAX_SINF_BYTES:
+        raise ValueError("SINF is too large")
+    list(children(sinf, 0, len(sinf)))
+    if len(sinf) < 8 or sinf[4:8] != b"sinf" or int.from_bytes(sinf[:4], "big") != len(sinf):
+        raise ValueError("expected one complete SINF atom")
+    if not supported_sinf(sinf):
+        raise ValueError("license format is not supported")
+    return sinf
+
+
+def write_new(path: Path, data: bytes) -> None:
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+        stream.write(data)
+
+
+def trigger_app(device: SSHDevice, license_bytes: bytes | None) -> tuple[str, str, bytes]:
+    account = sinf_field(license_bytes, b"user") if license_bytes is not None else None
+    listing = device.run("find /var/containers/Bundle/Application -type f -path '*/SC_Info/*.sinf' -print0")
+    for raw_path in sorted(path for path in listing.split(b"\0") if path and not path.endswith(b".v4.sinf")):
+        path = raw_path.decode("utf-8", "surrogateescape")
+        bundle = Path(path).parent.parent
+        if bundle.suffix != ".app":
+            continue
+        try:
+            installed_sinf = device.read(path)
+            if len(installed_sinf) > MAX_SINF_BYTES or (account is not None and sinf_field(installed_sinf, b"user") != account):
+                continue
+            if license_bytes is None and not supported_sinf(installed_sinf):
+                continue
+            info = plistlib.loads(device.read(str(bundle / "Info.plist")))
+            executable = info["CFBundleExecutable"]
+            if not isinstance(executable, str) or executable in ("", ".", "..") or "/" in executable:
+                continue
+            return str(bundle), executable, installed_sinf
+        except (KeyError, ValueError, plistlib.InvalidFileException):
+            continue
+    raise RuntimeError("no installed App Store app has a supported license for the selected account")
+
+
+def fairplayd_pid(device: SSHDevice) -> int:
+    listing = device.run("ps -e -o pid,comm").decode("utf-8", "replace")
+    pids = []
+    for line in listing.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2 and fields[0].isdigit() and re.fullmatch(r"fairplayd(?:\.A[0-9]+)?", Path(fields[1]).name):
+            pids.append(int(fields[0]))
+    if len(pids) != 1:
+        raise RuntimeError(f"expected one fairplayd process; found {len(pids)}")
+    return pids[0]
+
+
+def restart_fairplayd(device: SSHDevice) -> int:
+    previous = fairplayd_pid(device)
+    device.run(f"kill -TERM {previous}")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            current = fairplayd_pid(device)
+        except RuntimeError:
+            current = previous
+        if current != previous:
+            return current
+        time.sleep(0.1)
+    raise RuntimeError("fairplayd did not restart")
+
+
+def remote_pids(device: SSHDevice, executable: str) -> list[int]:
+    listing = device.run("ps -e -o pid,comm").decode("utf-8", "replace")
+    result = []
+    for line in listing.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2 and fields[0].isdigit() and fields[1] == executable:
+            result.append(int(fields[0]))
+    return result
+
+
+def stop_remote(device: SSHDevice, executable: str) -> None:
+    for pid in remote_pids(device, executable):
+        device.run(f"kill -TERM {pid}")
+
+
+def observe_uid_layer(device: SSHDevice, program: str, pid: int, output: str, trigger_program: str, executable: str) -> None:
+    command = " ".join(map(shlex.quote, (program, "observe-uid-layer", str(pid), output, "90")))
+    observer = subprocess.Popen(device.command + [command], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    trigger_process = None
+    direct_process = None
+    try:
+        if not select.select([observer.stderr], [], [], 15)[0]:
+            raise RuntimeError("FairPlay observer did not become ready")
+        ready = observer.stderr.readline()
+        if b"observing selector 21" not in ready:
+            raise RuntimeError("FairPlay observer failed: " + ready.decode("utf-8", "replace"))
+        trigger_command = " ".join(map(shlex.quote, (trigger_program, executable)))
+        trigger_process = subprocess.Popen(device.command + [trigger_command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        trigger_output, trigger_errors = trigger_process.communicate(timeout=15)
+        if trigger_process.returncode:
+            failure = trigger_output + trigger_errors
+            if trigger_process.returncode != 3:
+                raise RuntimeError("FairPlay trigger failed: " + failure.decode("utf-8", "replace"))
+            direct_process = subprocess.Popen(device.command + [shlex.quote(executable)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        output_bytes, errors = observer.communicate(timeout=100)
+        if observer.returncode:
+            raise RuntimeError("FairPlay observation failed: " + (output_bytes + errors).decode("utf-8", "replace"))
+    finally:
+        stop_remote(device, trigger_program)
+        if direct_process is not None:
+            stop_remote(device, executable)
+            if direct_process.poll() is None:
+                direct_process.terminate()
+                direct_process.wait(timeout=10)
+        if trigger_process is not None and trigger_process.poll() is None:
+            trigger_process.terminate()
+            trigger_process.wait(timeout=10)
+        if observer.poll() is None:
+            stop_remote(device, program)
+            observer.communicate(timeout=10)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--preflight",
-        action="store_true",
-        help="check bundled inputs without contacting the device",
-    )
-    parser.add_argument("--output-dir", type=Path, help="new directory; must not exist")
-    parser.add_argument(
-        "--sidb", type=Path, help="saved IC-Info.sidb; fetched from device when live"
-    )
-    parser.add_argument(
-        "--device-sidb-path",
-        default=DEVICE_SIDB,
-        help="on-device SIDB path when --sidb is omitted",
-    )
+    parser.add_argument("--bundle", type=Path, default=BUNDLE, help="device bundle directory (default: credential-retrieval/build/bundle)")
     license_group = parser.add_mutually_exclusive_group()
-    license_group.add_argument("--sinf", type=Path, help="raw license SINF")
-    license_group.add_argument(
-        "--ipa", type=Path, help="authorized IPA containing a SINF"
-    )
-    parser.add_argument(
-        "--sinf-member", help="IPA ZIP member if it has multiple license selectors"
-    )
-    parser.add_argument(
-        "--device-udid", help="40-digit device UDID; discovered automatically when live"
-    )
-    parser.add_argument(
-        "--uid-key-file", type=Path, help="offline verification: saved hardware UID key"
-    )
-    parser.add_argument(
-        "--hardware-artifact",
-        type=Path,
-        help="offline verification: saved standalone selector result",
-    )
-    parser.add_argument(
-        "--slot-address",
-        type=lambda value: int(value, 0),
-        help="16-byte side slot; required when replaying a saved hardware artifact",
-    )
+    license_group.add_argument("--ipa", type=Path, help="IPA containing a SINF")
+    license_group.add_argument("--sinf", type=Path, help="raw SINF")
+    parser.add_argument("--sinf-member", help="IPA ZIP member when selectors differ")
+    parser.add_argument("--output-dir", type=Path, help="new directory for credential.bin")
+    parser.add_argument("--device-udid", help="connected device UDID")
+    parser.add_argument("--ssh-port", type=int, default=2222, help="local USB SSH port (default: 2222)")
     args = parser.parse_args()
-    preflight()
-    if args.preflight:
-        if any(
-            (
-                args.output_dir,
-                args.uid_key_file,
-                args.hardware_artifact,
-                args.sidb,
-                args.sinf,
-                args.ipa,
-                args.sinf_member,
-                args.device_udid,
-                args.slot_address,
-            )
-        ):
-            parser.error("--preflight takes no retrieval inputs")
-        print("18G82 assets verified; device not contacted")
-        return
+    if args.sinf_member and not args.ipa:
+        parser.error("--sinf-member requires --ipa")
     if not args.output_dir or args.output_dir.exists():
         parser.error("--output-dir must name a new directory")
-    if not args.sinf and not args.ipa:
-        parser.error("--sinf or --ipa is required for retrieval")
-    if not args.sidb and args.uid_key_file and args.hardware_artifact:
-        parser.error("offline replay requires --sidb")
-    if args.hardware_artifact and args.slot_address is None:
-        parser.error("a saved hardware artifact requires its original --slot-address")
-    if args.slot_address is not None:
-        if not 0x100000000 <= args.slot_address < 1 << 40:
-            parser.error("--slot-address must fit the 40-bit encoder pointer")
-        if args.slot_address & 0x3FFF != SLOT_IN_PAGE:
-            parser.error("--slot-address must end in a 16 KiB page offset of 0x14f0")
-    sinf, sinf_label = license_sinf(args.sinf, args.ipa, args.sinf_member)
-    offline = bool(args.uid_key_file and args.hardware_artifact)
-    if offline and not args.device_udid:
-        parser.error("offline replay requires --device-udid")
+    sinf = license_sinf(args.sinf, args.ipa, args.sinf_member) if args.sinf or args.ipa else None
     udid = normalize_udid(args.device_udid) if args.device_udid else connected_udid()
-    product_type = None if offline else check_build(udid)
-    sidb = (
-        args.sidb.read_bytes()
-        if args.sidb
-        else read_device_sidb(udid, args.device_sidb_path)
-    )
-    if len(sidb) < 36 or (len(sidb) - 20) % 16 or sidb[:4] != bytes.fromhex("80060003"):
-        raise ValueError("unsupported SIDB version or length")
+    device = SSHDevice(args.ssh_port, udid)
+    try:
+        for name in DEVICE_FILES:
+            device.write(name, args.bundle / name, executable=name.endswith(".ios"))
+        program = device.path("credential.ios")
+        actual_udid = device.path("device-udid.bin")
+        device.run(" ".join(map(shlex.quote, (program, "device-udid", actual_udid))))
+        if device.read(actual_udid) != bytes.fromhex(udid):
+            raise ValueError("SSH tunnel is connected to a different device")
+        installed_app, executable, installed_sinf = trigger_app(device, sinf)
+        license_path = device.write("license.sinf", sinf if sinf is not None else installed_sinf)
+        trigger_dir = device.trigger_directory
+        device.run("cp -R " + shlex.quote(installed_app) + " " + shlex.quote(trigger_dir))
+        unique_executable = str(Path(trigger_dir) / Path(installed_app).name / executable)
+        uid_layer_path = device.path("uid-layer.bin")
+        observe_uid_layer(device, program, restart_fairplayd(device), uid_layer_path, device.path("trigger.ios"), unique_executable)
+        credential_path = device.path("credential.bin")
+        device.run(" ".join(map(shlex.quote, (program, "retrieve", license_path, uid_layer_path, credential_path))))
+        credential = device.read(credential_path)
+    finally:
+        device.cleanup()
     os.umask(0o077)
     args.output_dir.mkdir(parents=True, mode=0o700)
-    sidb_path = args.output_dir / "IC-Info.sidb"
-    sinf_path = args.output_dir / "license.sinf"
-    write_new(sidb_path, sidb)
-    write_new(sinf_path, sinf)
-    uid_path = args.output_dir / "uid899.bin"
-    request_path = args.output_dir / "request.bin"
-    source_path = args.output_dir / "source16.bin"
-    artifact_path = args.output_dir / "hardware-result.bin"
-    credential_path = args.output_dir / "credential.bin"
-    env = os.environ.copy()
-    env["FAIRPLAY_SIDB_FILE"] = str(sidb_path.resolve())
-    env["FAIRPLAY_DEVICE_UDID"] = udid
-    os.environ["FAIRPLAY_SIDB_FILE"] = env["FAIRPLAY_SIDB_FILE"]
-    os.environ["FAIRPLAY_DEVICE_UDID"] = udid
-
-    if args.uid_key_file:
-        write_new(uid_path, args.uid_key_file.read_bytes())
-        print("using saved UID-key checkpoint")
-    else:
-        run(
-            [
-                sys.executable,
-                str(ROOT / "device_key.py"),
-                "--device-udid",
-                udid,
-                "--output",
-                str(uid_path),
-            ],
-            env,
-        )
-    uid = uid_path.read_bytes()
-    if len(uid) != 16 or not any(uid):
-        raise ValueError("missing or malformed UID key")
-    env["FAIRPLAY_UID899_KEY_FILE"] = str(uid_path.resolve())
-    os.environ["FAIRPLAY_UID899_KEY_FILE"] = env["FAIRPLAY_UID899_KEY_FILE"]
-
-    fields = hardware__derive(sinf)
-    source16 = fields["source16"]
-    if len(source16) != 16:
-        raise ValueError("selected hardware source is not 16 bytes")
-    write_new(source_path, source16)
-
-    slots = (
-        [args.slot_address]
-        if args.slot_address is not None
-        else [
-            0x16B000000 + page * 0x4000 + SLOT_IN_PAGE
-            for page in secrets.SystemRandom().sample(range(0x4000), 3)
-        ]
-    )
-    selected_slot = None
-    for attempt, slot in enumerate(slots, 1):
-        attempt_request = args.output_dir / f"request-attempt-{attempt}.bin"
-        run(
-            [
-                sys.executable,
-                str(ROOT / "request.py"),
-                "--fully-synthetic-middle",
-                "--license-sinf",
-                str(sinf_path),
-                "--synthetic-selector-body-address",
-                hex(slot + BODY_FROM_SLOT),
-                "--stop-offset",
-                "0x199150",
-                "--output-request",
-                str(attempt_request),
-            ],
-            env,
-            compact=True,
-        )
-        if len(attempt_request.read_bytes()) != 552:
-            raise ValueError("synthetic selector request has unexpected length")
-        if args.hardware_artifact:
-            write_new(artifact_path, args.hardware_artifact.read_bytes())
-            print("using saved hardware-result checkpoint")
-        else:
-            try:
-                run(
-                    [
-                        sys.executable,
-                        str(ROOT / "device_call.py"),
-                        "--helper",
-                        str(ROOT / "helper.ios14"),
-                        "--request",
-                        str(attempt_request),
-                        "--source16",
-                        str(source_path),
-                        "--slot-address",
-                        hex(slot),
-                        "--expected-udid",
-                        udid,
-                        "--output",
-                        str(artifact_path),
-                    ],
-                    env,
-                )
-            except CommandFailure as error:
-                if error.code == 8 and attempt < len(slots):
-                    print(f"slot {slot:#x} occupied; trying another address")
-                    continue
-                raise
-        write_new(request_path, attempt_request.read_bytes())
-        selected_slot = slot
-        break
-    if selected_slot is None:
-        raise RuntimeError("no usable side-slot address")
-    artifact = artifact_path.read_bytes()
-    if len(artifact) != 920 or artifact[:0x160] != b"Z" * 0x160:
-        raise ValueError("hardware result is malformed")
-    sidewrite = artifact[-16:]
-
-    core3 = core3__derive(sinf, sidewrite)
-    output = run(
-        [
-            sys.executable,
-            str(ROOT / "core4.py"),
-            "--license-sinf",
-            str(sinf_path),
-            "--hardware-sidewrite-hex",
-            sidewrite.hex(),
-        ],
-        env,
-        compact=True,
-    )
-    matches = CONTEXT_RE.findall(output)
-    if len(matches) != 1 or "returned after " not in output:
-        raise ValueError("core-4 did not produce exactly one key context")
-    source = aes__core_decrypt(core3, bytes.fromhex(matches[0]))
-    table = tail__table_from_static_init((ROOT / "fairplayd.A2.ios14").read_bytes())
-    credential = tail__final_pass(tail__table_pass(tail__first_pass(source), table))
-    if len(credential) != 16:
-        raise ValueError("derived credential must contain 16 bytes")
-    derive_work16(credential, sinf)
-    write_new(credential_path, credential)
-    manifest = {
-        "uid899_sha256": digest(uid),
-        "request_sha256": digest(request_path.read_bytes()),
-        "source16_sha256": digest(source16),
-        "hardware_sha256": digest(artifact),
-        "credential_sha256": digest(credential),
-        "sidb_sha256": digest(sidb),
-        "sinf_sha256": digest(sinf),
-        "sinf_member": sinf_label,
-        "device_udid": udid,
-        "slot_address": hex(selected_slot),
-        "build": SUPPORTED_BUILD,
-        "product_type": product_type,
-        "used_saved_uid_checkpoint": bool(args.uid_key_file),
-        "used_saved_hardware_checkpoint": bool(args.hardware_artifact),
-    }
-    write_new(
-        args.output_dir / "manifest.json",
-        (json.dumps(manifest, indent=2) + "\n").encode(),
-    )
-    print(f"credential ready: {credential_path}")
+    write_new(args.output_dir / "credential.bin", credential)
+    print(f"credential ready: {args.output_dir / 'credential.bin'}")
 
 
 if __name__ == "__main__":

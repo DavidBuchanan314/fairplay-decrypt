@@ -1,63 +1,27 @@
-# Credential retrieval: iOS/iPadOS 14.7.1 (18G82)
+# Credential retrieval
 
-Retrieve a 16-byte credential for an authorized IPA on a jailbroken
-iOS/iPadOS 14.7.1 (18G82) device. This path is build-specific and does not
-support the iOS 26+ license format.
+Retrieve a reusable 16-byte FairPlay account credential from a jailbroken
+device. The host needs Python, `idevice_id`, `iproxy`, and USB SSH. The device
+runs native programs only; it does not need Python or Frida.
 
-## Live retrieval
+Tested on iOS 14 and iOS 18.
 
-The device must be paired over USB, signed into the account that owns the
-IPA, and running Frida with kernel-read support. Connect one device. On the
-host, install Python 3.10+ and `idevice_id`/`ideviceinfo`, then run from the
-project root:
+## Retrieve
 
-```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt -r credential-retrieval/requirements.txt
-python credential-retrieval/retrieve.py --preflight
-python credential-retrieval/retrieve.py \
-  --ipa /path/to/authorized.ipa \
-  --output-dir /path/to/a-new-run
-```
-
-Use `--sinf /path/to/license.sinf` instead of `--ipa` for a raw license. If
-an IPA has distinct license selectors, add `--sinf-member` to choose one.
-By default, the tool reads `IC-Info.sidb` from the device; `--sidb` accepts a
-local copy. It checks the device build, generates the selector request, calls
-the entitled helper, and verifies the credential against the license.
-
-The output directory must not exist. It contains the SIDB, SINF, device key,
-hardware result, `credential.bin`, and run manifest. Pass `credential.bin` to
-`decrypt.py` with `--credential`.
-
-## Offline verification
-
-To repeat the software derivation with files from a previous run:
+Connect one paired, jailbroken device with root SSH key access. Install at
+least one App Store app on that device. From the project root:
 
 ```sh
-python credential-retrieval/retrieve.py \
-  --sidb /path/to/IC-Info.sidb \
-  --sinf /path/to/license.sinf \
-  --device-udid 40_HEX_DIGITS_FROM_THAT_DEVICE \
-  --uid-key-file /path/to/uid899.bin \
-  --hardware-artifact /path/to/hardware-result.bin \
-  --slot-address 0xADDRESS_FROM_RUN_MANIFEST \
-  --output-dir /path/to/a-new-run
+make
+python3 credential-retrieval/retrieve.py --output-dir /path/to/new-output-directory
 ```
 
-The address must match the saved hardware result.
+The retriever uses the first installed app with a supported license. To
+select a particular account, pass `--ipa /path/to/app.ipa` or
+`--sinf /path/to/license.sinf`; an installed app under that account is still
+required. If an IPA has distinct license selectors, specify one with
+`--sinf-member`. Set `--ssh-port` if the USB SSH tunnel does not use port 2222.
+The output directory must not exist; it receives `credential.bin` for use
+with `decrypt.py --credential`.
 
-## Rebuild the device helper
-
-On a Mac with an iOS SDK and `ldid`:
-
-```sh
-xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=14.0 -O2 \
-  -Wall -Wextra credential-retrieval/helper.c -framework IOKit \
-  -o credential-retrieval/helper.ios14
-ldid -Scredential-retrieval/helper.entitlements.plist \
-  credential-retrieval/helper.ios14
-```
-
-After rebuilding, update the helper hash in `retrieve.py` if it changed.
+Build on a Mac with Xcode and `ldid`.

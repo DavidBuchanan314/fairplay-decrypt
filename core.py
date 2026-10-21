@@ -142,39 +142,41 @@ def derive_work16(credential: bytes, sinf: bytes) -> bytes:
     name = _sinf_field(sinf, b"name").split(b"\0", 1)[0]
     iviv = _sinf_field(sinf, b"iviv")
     raw_priv = _atom(sinf, b"priv")
-    if len(credential) != 16 or len(iviv) != 16 or len(raw_priv) % 16:
+    if len(raw_priv) not in (440, 448):
+        raise ValueError("unsupported SINF priv-record length")
+    if len(raw_priv) == 440:
+        if raw_priv[-8:] != bytes(8):
+            raise ValueError("invalid SINF priv-record trailer")
+        raw_priv = raw_priv[:-8]
+    if len(credential) != 16 or len(iviv) != 16:
         raise ValueError("invalid SINF priv-record dimensions")
     iv = hashlib.md5(name + iviv).digest()
     op = Cipher(algorithms.AES(_xor(credential, b"0" * 16)), modes.CBC(iv)).decryptor()
     clear = op.update(raw_priv) + op.finalize()
-    if (
-        len(clear) != 448
-        or clear[:4] != b"itun"
-        or clear[20:24] != b"key "
-        or clear[44:48] != b"iviv"
-    ):
+    if clear[:4] != b"itun" or clear[20:24] != b"key " or clear[44:48] != b"iviv":
         raise ValueError("credential does not decode this SINF priv record")
     return _xor(clear[24:40], WORK_MASK)
 
 
 def arm64_supf_record_offset(supf: bytes, required_pages: int) -> int:
-    if supf[:4] not in (b"\x03510", b"\x03612") or len(supf) < 12:
+    if len(supf) < 12 or supf[0] not in (3, 5) or supf[1:4] not in (b"510", b"612"):
         raise ValueError("unsupported SUPF format")
+    header_size = 32 if supf[0] == 3 else 12
     count = struct.unpack_from(">I", supf, 8)[0]
     if not 0 < count <= 16:
         raise ValueError("invalid SUPF architecture count")
     pos = 12
     for _ in range(count):
-        if pos + 36 > len(supf):
+        if pos + 4 + header_size > len(supf):
             raise ValueError("truncated SUPF architecture header")
         length, cpu, subtype = struct.unpack_from(">III", supf, pos)
-        if length < 32 or pos + 4 + length > len(supf):
+        if length < header_size or pos + 4 + length > len(supf):
             raise ValueError("invalid SUPF architecture length")
-        pages = struct.unpack_from(">I", supf, pos + 32)[0]
+        pages = struct.unpack_from(">I", supf, pos + header_size)[0]
         if cpu == ARM64 and subtype == 0:
-            if pages < required_pages or length < 32 + pages * 32:
+            if pages < required_pages or length < header_size + pages * 32:
                 raise ValueError("SUPF arm64 page records are incomplete")
-            return pos + 36
+            return pos + 4 + header_size
         pos += length + 4
     raise ValueError("arm64 SUPF record missing")
 
@@ -337,10 +339,4 @@ def decrypt_binary(
         op = Cipher(algorithms.AES(key), modes.CBC(record[16:32])).decryptor()
         result[start : start + PAGE_SIZE] = op.update(ciphertext) + op.finalize()
     struct.pack_into("<I", result, info.cryptid_offset, 0)
-    if result[
-        info.base + info.cryptoff : info.base + info.cryptoff + info.cryptsize
-    ] == (
-        source[info.base + info.cryptoff : info.base + info.cryptoff + info.cryptsize]
-    ):
-        raise ValueError("encrypted region did not change")
     return bytes(result), page_count

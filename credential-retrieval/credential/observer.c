@@ -1,0 +1,312 @@
+#include "observer.h"
+#include <mach/arm/thread_status.h>
+#include <mach/exc.h>
+#include <mach/exception_types.h>
+#include <mach/mach.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+enum { MAX_THREADS = 256 };
+enum { USER_BREAKPOINT = 0x1e5 };
+
+typedef struct {
+    thread_t port;
+    arm_debug_state64_t saved;
+    int saved_valid;
+    uint64_t return_address;
+    int selector21;
+} ThreadWatch;
+
+typedef struct {
+    task_t task;
+    mach_port_t exception_port;
+    uint64_t call_address;
+    SelectorReturnCallback callback;
+    void *context;
+    ThreadWatch threads[MAX_THREADS];
+    size_t thread_count;
+    exception_mask_t old_masks[EXC_TYPES_COUNT];
+    mach_port_t old_handlers[EXC_TYPES_COUNT];
+    exception_behavior_t old_behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t old_flavors[EXC_TYPES_COUNT];
+    mach_msg_type_number_t old_count;
+    int handler_installed;
+    int result;
+} Observer;
+
+static Observer *active_observer;
+static volatile sig_atomic_t observer_stopped;
+extern boolean_t exc_server(mach_msg_header_t *request, mach_msg_header_t *reply);
+
+static void stop_observer(int signal_number) {
+    (void)signal_number;
+    observer_stopped = 1;
+}
+
+static int set_breakpoints(ThreadWatch *watch, uint64_t call_address, uint64_t return_address) {
+    arm_debug_state64_t state = watch->saved;
+    state.__bvr[0] = call_address;
+    state.__bcr[0] = return_address ? 0 : USER_BREAKPOINT;
+    state.__bvr[1] = return_address;
+    state.__bcr[1] = return_address ? USER_BREAKPOINT : 0;
+    return thread_set_state(watch->port, ARM_DEBUG_STATE64, (thread_state_t)&state, ARM_DEBUG_STATE64_COUNT) == KERN_SUCCESS ? 0 : -1;
+}
+
+kern_return_t catch_exception_raise(mach_port_t exception_port, mach_port_t thread, mach_port_t task, exception_type_t exception, exception_data_t code, mach_msg_type_number_t code_count) {
+    (void)code;
+    (void)code_count;
+    Observer *observer = active_observer;
+    if (!observer || exception_port != observer->exception_port || task != observer->task || exception != EXC_BREAKPOINT) {
+        return KERN_FAILURE;
+    }
+
+    ThreadWatch *watch = NULL;
+    for (size_t i = 0; i < observer->thread_count; i++) {
+        if (observer->threads[i].port == thread) {
+            watch = &observer->threads[i];
+            break;
+        }
+    }
+
+    if (!watch) {
+        return KERN_FAILURE;
+    }
+
+    arm_thread_state64_t state = {0};
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) != KERN_SUCCESS) {
+        return KERN_FAILURE;
+    }
+
+    uint64_t pc = (uint64_t)(uintptr_t)arm_thread_state64_get_pc(state);
+    if (watch->port == MACH_PORT_NULL) {
+        observer->result = -1;
+        observer_stopped = 1;
+        return KERN_FAILURE;
+    }
+
+    if (pc == observer->call_address && !watch->return_address) {
+        watch->selector21 = state.__x[1] == 21;
+        watch->return_address = (uint64_t)(uintptr_t)arm_thread_state64_get_lr(state);
+        if (!watch->return_address || set_breakpoints(watch, observer->call_address, watch->return_address)) {
+            observer->result = -1;
+            observer_stopped = 1;
+            return KERN_FAILURE;
+        }
+
+        return KERN_SUCCESS;
+    }
+
+    if (pc == watch->return_address && watch->return_address) {
+        watch->return_address = 0;
+        if (set_breakpoints(watch, observer->call_address, 0)) {
+            observer->result = -1;
+            observer_stopped = 1;
+            return KERN_FAILURE;
+        }
+
+        if (watch->selector21) {
+            int result = observer->callback(observer->task, observer->context);
+            if (result) {
+                observer->result = result;
+                observer_stopped = 1;
+            }
+        }
+
+        return KERN_SUCCESS;
+    }
+
+    return KERN_FAILURE;
+}
+
+kern_return_t catch_exception_raise_state(mach_port_t exception_port, exception_type_t exception, const exception_data_t code, mach_msg_type_number_t code_count, int *flavor, const thread_state_t old_state, mach_msg_type_number_t old_count, thread_state_t new_state, mach_msg_type_number_t *new_count) {
+    (void)exception_port;
+    (void)exception;
+    (void)code;
+    (void)code_count;
+    (void)flavor;
+    (void)old_state;
+    (void)old_count;
+    (void)new_state;
+    (void)new_count;
+    return KERN_FAILURE;
+}
+
+kern_return_t catch_exception_raise_state_identity(mach_port_t exception_port, mach_port_t thread, mach_port_t task, exception_type_t exception, exception_data_t code, mach_msg_type_number_t code_count, int *flavor, thread_state_t old_state, mach_msg_type_number_t old_count, thread_state_t new_state, mach_msg_type_number_t *new_count) {
+    (void)exception_port;
+    (void)thread;
+    (void)task;
+    (void)exception;
+    (void)code;
+    (void)code_count;
+    (void)flavor;
+    (void)old_state;
+    (void)old_count;
+    (void)new_state;
+    (void)new_count;
+    return KERN_FAILURE;
+}
+
+static void restore_observer(Observer *observer) {
+    if (observer->task != MACH_PORT_NULL) {
+        int suspended = task_suspend(observer->task) == KERN_SUCCESS;
+        for (size_t i = 0; i < observer->thread_count; i++) {
+            ThreadWatch *watch = &observer->threads[i];
+            if (watch->saved_valid) {
+                thread_set_state(watch->port, ARM_DEBUG_STATE64, (thread_state_t)&watch->saved, ARM_DEBUG_STATE64_COUNT);
+            }
+            mach_port_deallocate(mach_task_self(), watch->port);
+        }
+
+        if (observer->handler_installed) {
+            for (mach_msg_type_number_t i = 0; i < observer->old_count; i++) {
+                task_set_exception_ports(observer->task, observer->old_masks[i], observer->old_handlers[i], observer->old_behaviors[i], observer->old_flavors[i]);
+                if (observer->old_handlers[i] != MACH_PORT_NULL) {
+                    mach_port_deallocate(mach_task_self(), observer->old_handlers[i]);
+                }
+            }
+
+            if (observer->old_count == 0) {
+                task_set_exception_ports(observer->task, EXC_MASK_BREAKPOINT, MACH_PORT_NULL, EXCEPTION_DEFAULT, ARM_THREAD_STATE64);
+            }
+        }
+
+        if (suspended) {
+            task_resume(observer->task);
+        }
+
+        mach_port_deallocate(mach_task_self(), observer->task);
+    }
+
+    if (observer->exception_port != MACH_PORT_NULL) {
+        mach_port_destroy(mach_task_self(), observer->exception_port);
+    }
+}
+
+int observe_selector21(pid_t pid, SelectorReturnCallback callback, void *context, unsigned seconds) {
+    Observer *observer = calloc(1, sizeof(*observer));
+    if (!observer || !callback || seconds == 0) {
+        free(observer);
+        return -1;
+    }
+
+    observer->callback = callback;
+    observer->context = context;
+    observer->task = MACH_PORT_NULL;
+    observer->exception_port = MACH_PORT_NULL;
+    observer->result = 0;
+    int outcome = -1;
+    kern_return_t status = task_for_pid(mach_task_self(), pid, &observer->task);
+    if (status != KERN_SUCCESS || observer->task == MACH_PORT_NULL) {
+        fprintf(stderr, "task_for_pid(%d) failed: %#x\n", pid, status);
+        goto end;
+    }
+
+    void *symbol = dlsym(RTLD_DEFAULT, "IOConnectCallStructMethod");
+    uint8_t remote[16];
+    vm_size_t got = 0;
+    if (!symbol || vm_read_overwrite(observer->task, (vm_address_t)(uintptr_t)symbol, sizeof(remote), (vm_address_t)(uintptr_t)remote, &got) != KERN_SUCCESS || got != sizeof(remote) || memcmp(remote, symbol, sizeof(remote))) {
+        fprintf(stderr, "IOKit function is not mapped at the same address in fairplayd\n");
+        goto end;
+    }
+
+    observer->call_address = (uint64_t)(uintptr_t)symbol;
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &observer->exception_port) != KERN_SUCCESS || mach_port_insert_right(mach_task_self(), observer->exception_port, observer->exception_port, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
+        goto end;
+    }
+
+    if (task_suspend(observer->task) != KERN_SUCCESS) {
+        goto end;
+    }
+
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0;
+    status = task_threads(observer->task, &threads, &count);
+    if (status != KERN_SUCCESS || count > MAX_THREADS) {
+        if (threads) {
+            vm_deallocate(mach_task_self(), (vm_address_t)(uintptr_t)threads, count * sizeof(thread_t));
+        }
+
+        task_resume(observer->task);
+        goto end;
+    }
+
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        ThreadWatch *watch = &observer->threads[observer->thread_count++];
+        watch->port = threads[i];
+        mach_msg_type_number_t state_count = ARM_DEBUG_STATE64_COUNT;
+        status = thread_get_state(watch->port, ARM_DEBUG_STATE64, (thread_state_t)&watch->saved, &state_count);
+        if (status != KERN_SUCCESS) {
+            fprintf(stderr, "cannot read debug state for thread %u: %#x\n", watch->port, status);
+            break;
+        }
+
+        watch->saved_valid = 1;
+        if (watch->saved.__bcr[0] || watch->saved.__bcr[1]) {
+            fprintf(stderr, "debug breakpoint slots 0 and 1 are in use\n");
+            status = KERN_FAILURE;
+            break;
+        }
+
+        status = set_breakpoints(watch, observer->call_address, 0) ? KERN_FAILURE : KERN_SUCCESS;
+        if (status != KERN_SUCCESS) {
+            fprintf(stderr, "cannot set user breakpoint on thread %u\n", watch->port);
+            break;
+        }
+    }
+
+    for (mach_msg_type_number_t i = (mach_msg_type_number_t)observer->thread_count; i < count; i++) {
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+
+    vm_deallocate(mach_task_self(), (vm_address_t)(uintptr_t)threads, count * sizeof(thread_t));
+    if (status != KERN_SUCCESS) {
+        task_resume(observer->task);
+        goto end;
+    }
+
+    observer->old_count = EXC_TYPES_COUNT;
+    status = task_swap_exception_ports(observer->task, EXC_MASK_BREAKPOINT, observer->exception_port, EXCEPTION_DEFAULT, ARM_THREAD_STATE64, observer->old_masks, &observer->old_count, observer->old_handlers, observer->old_behaviors, observer->old_flavors);
+    if (status != KERN_SUCCESS) {
+        fprintf(stderr, "cannot install breakpoint exception handler: %#x\n", status);
+        task_resume(observer->task);
+        goto end;
+    }
+
+    observer->handler_installed = 1;
+    active_observer = observer;
+    observer_stopped = 0;
+    struct sigaction action = {0}, old_int = {0}, old_term = {0}, old_alarm = {0};
+    action.sa_handler = stop_observer;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, &old_int);
+    sigaction(SIGTERM, &action, &old_term);
+    sigaction(SIGALRM, &action, &old_alarm);
+    task_resume(observer->task);
+    alarm(seconds);
+    fprintf(stderr, "observing selector 21 in pid %d for up to %u seconds\n", pid, seconds);
+    while (!observer_stopped) {
+        mach_msg_return_t received = mach_msg_server_once(exc_server, 4096, observer->exception_port, MACH_RCV_INTERRUPT);
+        if (received != MACH_MSG_SUCCESS && received != MACH_RCV_INTERRUPTED) {
+            fprintf(stderr, "exception receive failed: %#x\n", received);
+            break;
+        }
+    }
+
+    alarm(0);
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+    sigaction(SIGALRM, &old_alarm, NULL);
+    outcome = observer->result;
+    active_observer = NULL;
+
+end:
+    restore_observer(observer);
+    free(observer);
+    return outcome;
+}
