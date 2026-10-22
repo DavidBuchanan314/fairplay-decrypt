@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Decrypt an authorized IPA using a 16-byte credential."""
 
+from __future__ import annotations
+
 import argparse
 import os
 from pathlib import Path
