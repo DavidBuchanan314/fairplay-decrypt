@@ -13,7 +13,7 @@ eight zero bytes.
 
 ## Set up
 
-From this directory, with Python 3.10+ and a C compiler:
+From this directory, with Python 3.9+ and a C compiler:
 
 ```sh
 python3 -m venv .venv

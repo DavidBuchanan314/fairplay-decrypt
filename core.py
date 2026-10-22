@@ -40,7 +40,9 @@ class MachoInfo:
 
 
 def _xor(a: bytes, b: bytes) -> bytes:
-    return bytes(x ^ y for x, y in zip(a, b, strict=True))
+    if len(a) != len(b):
+        raise ValueError("XOR inputs must have equal lengths")
+    return bytes(x ^ y for x, y in zip(a, b))
 
 
 def arm64_encryption_info(data: bytes) -> MachoInfo:
@@ -262,7 +264,7 @@ def finish(state: bytes) -> bytes:
         high = (high - ((high << 1) & 0x31F6) + 0x18FB) & 0xFFFF
         final.extend((low, high))
     return b"".join(
-        (a ^ b).to_bytes(2, "big") for a, b in zip(initial, final, strict=True)
+        (a ^ b).to_bytes(2, "big") for a, b in zip(initial, final)
     )
 
 
