@@ -22,6 +22,31 @@ def supf_paths(names: set[str]) -> list[str]:
     return sorted(by_binary.values())
 
 
+def enclosing_app_sinf(names: set[str], bundle: str) -> str | None:
+    parts = bundle.split("/")
+    for i in range(len(parts), 0, -1):
+        prefix = "/".join(parts[:i])
+        if not prefix.endswith(".app"):
+            continue
+        sc_info = prefix + "/SC_Info/"
+        sinfs = sorted(
+            name
+            for name in names
+            if name.startswith(sc_info)
+            and name.endswith(".sinf")
+            and name.count("/") == sc_info.count("/")
+        )
+        if not sinfs:
+            continue
+        for suffix in (".sinf", ".v4.sinf"):
+            preferred = sc_info + Path(prefix).stem + suffix
+            if preferred in sinfs:
+                return preferred
+        unversioned = [name for name in sinfs if not name.endswith(".v4.sinf")]
+        return (unversioned or sinfs)[0]
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ipa", type=Path, help="authorized encrypted IPA")
@@ -69,7 +94,7 @@ def main() -> None:
             sinf_path = bundle + "/SC_Info/" + sinf_name
             if sinf_path not in names and filename.endswith(".v5.supf"):
                 sinf_path = bundle + "/SC_Info/" + stem + ".sinf"
-            if binary_path not in names or sinf_path not in names:
+            if binary_path not in names:
                 raise ValueError(f"SUPF lacks binary/SINF: {supf_path}")
             source = archive.read(binary_path)
             try:
@@ -78,6 +103,11 @@ def main() -> None:
                 if str(error).startswith("unsupported cryptid/size: 0,"):
                     continue
                 raise
+            if sinf_path not in names:
+                fallback = enclosing_app_sinf(names, bundle)
+                if fallback is None:
+                    raise ValueError(f"SUPF lacks binary/SINF: {supf_path}")
+                sinf_path = fallback
             plan.append(
                 (
                     binary_path,
