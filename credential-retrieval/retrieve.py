@@ -145,7 +145,7 @@ def fairplayd_pid(device: SSHDevice) -> int:
     pids = []
     for line in listing.splitlines():
         fields = line.strip().split(None, 1)
-        if len(fields) == 2 and fields[0].isdigit() and re.fullmatch(r"fairplayd(?:\.A[0-9]+)?", Path(fields[1]).name):
+        if len(fields) == 2 and fields[0].isdigit() and re.fullmatch(r"fairplayd(?:\.[AH][0-9]+)?", Path(fields[1]).name):
             pids.append(int(fields[0]))
     if len(pids) != 1:
         raise RuntimeError(f"expected one fairplayd process; found {len(pids)}")

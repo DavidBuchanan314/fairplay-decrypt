@@ -160,13 +160,16 @@ int main(int argc, char **argv) {
 
     uint8_t *encrypted = mapping + slice.offset + encryption.cryptoff;
     size_t page_size = (size_t)getpagesize();
-    if ((uintptr_t)encrypted % page_size) {
+    uintptr_t aligned_addr = (uintptr_t)encrypted & ~(uintptr_t)(page_size - 1);
+    if (aligned_addr < (uintptr_t)(mapping + slice.offset)) {
         fprintf(stderr, "encrypted region is not page-aligned\n");
         goto end;
     }
 
-    size_t encrypted_length = ((size_t)encryption.cryptsize + page_size - 1) & ~(page_size - 1);
-    if (encrypted_length > slice.size - encryption.cryptoff) {
+    size_t lead = (size_t)((uintptr_t)encrypted - aligned_addr);
+    size_t encrypted_length = (lead + (size_t)encryption.cryptsize + page_size - 1) & ~(page_size - 1);
+    uint8_t *aligned = (uint8_t *)aligned_addr;
+    if ((uintptr_t)aligned < (uintptr_t)(mapping + slice.offset) || encrypted_length > (size_t)((mapping + slice.offset + slice.size) - aligned)) {
         fprintf(stderr, "encrypted mapping exceeds the executable\n");
         goto end;
     }
@@ -177,7 +180,7 @@ int main(int argc, char **argv) {
         goto end;
     }
 
-    if (remap(encrypted, encrypted_length, encryption.cryptid, header.cputype, header.cpusubtype)) {
+    if (remap(aligned, encrypted_length, encryption.cryptid, header.cputype, header.cpusubtype)) {
         fprintf(stderr, "mremap_encrypted failed: %s\n", strerror(errno));
         goto end;
     }
