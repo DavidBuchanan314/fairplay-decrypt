@@ -31,9 +31,21 @@ def connected_udid() -> str:
 
 def normalize_udid(value: str) -> str:
     value = value.strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", value):
-        raise ValueError("device UDID must contain 40 hexadecimal digits")
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{8}-[0-9a-f]{16})", value):
+        raise ValueError("device UDID must be 40 hex digits or 8-16 hex digits")
     return value
+
+
+def fairplay_device_id(value: str) -> bytes:
+    """Keep USB identity separate from the 20-byte FairPlay identity.
+
+    Modern format verified against iOS 16.3.1 fairplayd.H2's parser and
+    its runtime output (new-format branch at image VA 0x1002789d4).
+    """
+    value = normalize_udid(value)
+    if "-" in value:
+        return bytes.fromhex("6097a4b0c20a0a9f" + value.replace("-", ""))
+    return bytes.fromhex(value)
 
 
 def children(data: bytes, start: int, end: int):
@@ -243,7 +255,7 @@ def main() -> None:
         program = device.path("credential.ios")
         actual_udid = device.path("device-udid.bin")
         device.run(" ".join(map(shlex.quote, (program, "device-udid", actual_udid))))
-        if device.read(actual_udid) != bytes.fromhex(udid):
+        if device.read(actual_udid) != fairplay_device_id(udid):
             raise ValueError("SSH tunnel is connected to a different device")
         installed_app, executable, installed_sinf = trigger_app(device, sinf)
         license_path = device.write("license.sinf", sinf if sinf is not None else installed_sinf)

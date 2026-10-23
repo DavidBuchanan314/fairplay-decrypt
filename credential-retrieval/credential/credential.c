@@ -266,6 +266,20 @@ static int hex_byte(char first, char second, uint8_t *value) {
 }
 
 static int parse_udid(const char *hex, uint8_t udid[20]) {
+    /* iOS 16.3.1 fairplayd.H2: new-format UDID becomes a fixed 8-byte
+     * prefix followed by the 12 decoded bytes, preserving textual order.
+     * Verified at 0x1002789d4 and the parser's runtime output. */
+    if (strlen(hex) == 25 && hex[8] == '-') {
+        static const uint8_t prefix[8] = {0x60, 0x97, 0xa4, 0xb0, 0xc2, 0x0a, 0x0a, 0x9f};
+        memcpy(udid, prefix, sizeof(prefix));
+        for (size_t i = 0; i < 12; i++) {
+            size_t at = i * 2 + (i >= 4);
+            if (hex_byte(hex[at], hex[at + 1], &udid[8 + i])) {
+                return -1;
+            }
+        }
+        return 0;
+    }
     if (strlen(hex) != 40) {
         return -1;
     }
