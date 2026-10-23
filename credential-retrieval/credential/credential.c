@@ -19,6 +19,7 @@
 #include <string.h>
 #include <spawn.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -922,6 +923,23 @@ static int observe_uid_callback(mach_port_t task, void *opaque) {
     return scan_uid_task(task, scan, &bytes_read);
 }
 
+static int fairplay_selector(uint32_t *selector) {
+    struct utsname system_info;
+    if (uname(&system_info)) {
+        return -1;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    unsigned long major = strtoul(system_info.release, &end, 10);
+    if (errno || end == system_info.release || (*end != '.' && *end != '\0')) {
+        return -1;
+    }
+
+    *selector = major <= 18 ? 9 : 21;
+    return 0;
+}
+
 static int run_observe_uid_layer(int argc, char **argv) {
     if ((argc != 4 && argc != 5) || access(argv[3], F_OK) == 0) {
         return 2;
@@ -946,6 +964,12 @@ static int run_observe_uid_layer(int argc, char **argv) {
         return 2;
     }
 
+    uint32_t selector;
+    if (fairplay_selector(&selector)) {
+        fprintf(stderr, "cannot determine FairPlay selector\n");
+        return 1;
+    }
+
     const char *sidb_name = "/private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sidb";
     Bytes sidb = {0};
     UIDLayerScan scan = {0};
@@ -956,7 +980,7 @@ static int run_observe_uid_layer(int argc, char **argv) {
     }
 
     scan.length = sidb.size - 20;
-    int found = observe_selector21((pid_t)parsed, observe_uid_callback, &scan, seconds);
+    int found = observe_fairplay_requests((pid_t)parsed, selector, observe_uid_callback, &scan, seconds);
     if (found == 1 && !write_new(argv[3], scan.uid.data, scan.uid.size)) {
         result = 0;
     }
@@ -986,11 +1010,18 @@ static int run_retrieve(int argc, char **argv) {
 
     const char *sidb_name = "/private/var/mobile/Library/FairPlay/iTunes_Control/iTunes/IC-Info.sidb";
     char helper[PATH_MAX], table_name[PATH_MAX], word_table_name[PATH_MAX];
-    if (companion_path("selector21.ios", helper) || companion_path("static-key-table.bin", table_name) || companion_path("core4-word-table.bin", word_table_name)) {
+    if (companion_path("driver.ios", helper) || companion_path("static-key-table.bin", table_name) || companion_path("core4-word-table.bin", word_table_name)) {
         fprintf(stderr, "cannot locate companion files\n");
         return 1;
     }
 
+    uint32_t selector;
+    if (fairplay_selector(&selector)) {
+        fprintf(stderr, "cannot determine FairPlay selector\n");
+        return 1;
+    }
+
+    char *selector_text = selector == 9 ? "9" : "21";
     Bytes sinf = {0}, sidb = {0}, table = {0}, word_table = {0};
     Bytes uid_layer = {0}, clear = {0}, artifact = {0};
     Selection selected = {0};
@@ -1071,7 +1102,7 @@ static int run_retrieve(int argc, char **argv) {
         }
 
         snprintf(slot_text, sizeof(slot_text), "%#llx", (unsigned long long)slot);
-        char *helper_args[] = {helper, request_paths[attempt], artifact_paths[attempt], source_path, slot_text, NULL};
+        char *helper_args[] = {helper, request_paths[attempt], artifact_paths[attempt], source_path, slot_text, selector_text, NULL};
         stage = "FairPlay driver call";
         int result = run_child(helper, helper_args);
         if (result == 8) {

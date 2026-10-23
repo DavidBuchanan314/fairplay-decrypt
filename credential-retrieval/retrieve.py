@@ -18,7 +18,7 @@ from native_ssh import SSHDevice
 
 ROOT = Path(__file__).resolve().parent
 BUNDLE = ROOT / "build" / "bundle"
-DEVICE_FILES = ("credential.ios", "selector21.ios", "trigger.ios", "static-key-table.bin", "core4-word-table.bin")
+DEVICE_FILES = ("credential.ios", "driver.ios", "trigger.ios", "static-key-table.bin", "core4-word-table.bin")
 MAX_SINF_BYTES = 1 << 20
 
 
@@ -203,7 +203,7 @@ def observe_uid_layer(device: SSHDevice, program: str, pid: int, output: str, tr
         if not select.select([observer.stderr], [], [], 15)[0]:
             raise RuntimeError("FairPlay observer did not become ready")
         ready = observer.stderr.readline()
-        if b"observing selector 21" not in ready:
+        if b"observing FairPlay requests" not in ready:
             raise RuntimeError("FairPlay observer failed: " + ready.decode("utf-8", "replace"))
         trigger_command = " ".join(map(shlex.quote, (trigger_program, executable)))
         trigger_process = subprocess.Popen(device.command + [trigger_command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

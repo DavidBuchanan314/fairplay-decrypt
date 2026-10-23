@@ -19,13 +19,14 @@ typedef struct {
     arm_debug_state64_t saved;
     int saved_valid;
     uint64_t return_address;
-    int selector21;
+    int matched_selector;
 } ThreadWatch;
 
 typedef struct {
     task_t task;
     mach_port_t exception_port;
     uint64_t call_address;
+    uint32_t selector;
     SelectorReturnCallback callback;
     void *context;
     ThreadWatch threads[MAX_THREADS];
@@ -108,7 +109,7 @@ kern_return_t catch_exception_raise(mach_port_t exception_port, mach_port_t thre
     }
 
     if (pc == observer->call_address && !watch->return_address) {
-        watch->selector21 = state.__x[1] == 21;
+        watch->matched_selector = state.__x[1] == observer->selector;
         watch->return_address = (uint64_t)(uintptr_t)arm_thread_state64_get_lr(state);
         if (!watch->return_address || set_breakpoints(watch, observer->call_address, watch->return_address)) {
             observer->result = -1;
@@ -127,7 +128,7 @@ kern_return_t catch_exception_raise(mach_port_t exception_port, mach_port_t thre
             return KERN_FAILURE;
         }
 
-        if (watch->selector21) {
+        if (watch->matched_selector) {
             int result = observer->callback(observer->task, observer->context);
             if (result) {
                 observer->result = result;
@@ -205,13 +206,14 @@ static void restore_observer(Observer *observer) {
     }
 }
 
-int observe_selector21(pid_t pid, SelectorReturnCallback callback, void *context, unsigned seconds) {
+int observe_fairplay_requests(pid_t pid, uint32_t selector, SelectorReturnCallback callback, void *context, unsigned seconds) {
     Observer *observer = calloc(1, sizeof(*observer));
-    if (!observer || !callback || seconds == 0) {
+    if (!observer || !callback || seconds == 0 || (selector != 9 && selector != 21)) {
         free(observer);
         return -1;
     }
 
+    observer->selector = selector;
     observer->callback = callback;
     observer->context = context;
     observer->task = MACH_PORT_NULL;
@@ -306,7 +308,7 @@ int observe_selector21(pid_t pid, SelectorReturnCallback callback, void *context
     sigaction(SIGALRM, &action, &old_alarm);
     task_resume(observer->task);
     alarm(seconds);
-    fprintf(stderr, "observing selector 21 in pid %d for up to %u seconds\n", pid, seconds);
+    fprintf(stderr, "observing FairPlay requests with selector %u in pid %d for up to %u seconds\n", selector, pid, seconds);
     while (!observer_stopped) {
         mach_msg_return_t received = mach_msg_server_once(exc_server, 4096, observer->exception_port, MACH_RCV_INTERRUPT);
         if (received != MACH_MSG_SUCCESS && received != MACH_RCV_INTERRUPTED) {

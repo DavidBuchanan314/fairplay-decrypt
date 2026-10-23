@@ -1,4 +1,4 @@
-/* FairPlayIOKit selector-21 helper. */
+/* FairPlayIOKit driver-call helper. */
 #include <IOKit/IOKitLib.h>
 #include <mach/vm_map.h>
 #include <errno.h>
@@ -14,7 +14,7 @@ enum { PREFIX = 0x160, SIZE = 552 };
 
 static void expired(int signum) {
     (void)signum;
-    const char text[] = "selector21: alarm expired inside IOKit call\n";
+    const char text[] = "driver: alarm expired inside IOKit call\n";
     (void)write(STDERR_FILENO, text, sizeof(text) - 1);
     _exit(124);
 }
@@ -64,8 +64,8 @@ static int write_exact_new(const char *path, const void *bytes, size_t size) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: %s REQUEST.bin OUTPUT.bin SOURCE16.bin SLOT_ADDRESS\n", argv[0]);
+    if (argc != 6 || (strcmp(argv[5], "9") && strcmp(argv[5], "21"))) {
+        fprintf(stderr, "usage: %s REQUEST.bin OUTPUT.bin SOURCE16.bin SLOT_ADDRESS SELECTOR\n", argv[0]);
         return 2;
     }
 
@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
     signal(SIGALRM, expired);
     alarm(8);
     size_t output_size = SIZE;
-    status = IOConnectCallStructMethod(connection, 21, region + PREFIX, SIZE, region + PREFIX, &output_size);
+    status = IOConnectCallStructMethod(connection, (uint32_t)strtoul(argv[5], NULL, 10), region + PREFIX, SIZE, region + PREFIX, &output_size);
     alarm(0);
     memcpy(side_result, known_slot, sizeof(side_result));
     vm_deallocate(mach_task_self(), mapped_page, mapped_size);

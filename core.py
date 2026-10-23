@@ -161,7 +161,7 @@ def derive_work16(credential: bytes, sinf: bytes) -> bytes:
 
 
 def arm64_supf_record_offset(supf: bytes, required_pages: int) -> int:
-    if len(supf) < 12 or supf[0] not in (3, 5) or supf[1:4] not in (b"510", b"612"):
+    if len(supf) < 12 or supf[0] not in (3, 5) or supf[1:4] not in (b"507", b"510", b"612"):
         raise ValueError("unsupported SUPF format")
     header_size = 32 if supf[0] == 3 else 12
     count = struct.unpack_from(">I", supf, 8)[0]
