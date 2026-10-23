@@ -54,7 +54,7 @@ static void stop_observer(int signal_number) {
  * every enable bit first releases the thread's old object; installing the
  * desired state then forces a fresh object and a hardware-register reload.
  * Preserve all saved slots in the final state, including other debuggers'
- * watchpoints. See README.md for the source references.
+ * watchpoints.
  */
 static kern_return_t replace_debug_state(thread_t thread, const arm_debug_state64_t *desired) {
     arm_debug_state64_t cleared = {0};
