@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from pathlib import Path
 import struct
-import subprocess
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -234,60 +232,21 @@ def finish(state: bytes) -> bytes:
     )
 
 
-class BlockTransform:
-    def __init__(self, executable: Path, constants: Path):
-        if not executable.is_file() or not constants.is_file():
-            raise FileNotFoundError(
-                "build transform executable and keep constant-data file"
-            )
-        self.executable = executable
-        self.constants = constants
-        self.process = subprocess.Popen(
-            [str(executable), "--batch", str(constants)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.process.stdin and not self.process.stdin.closed:
-            self.process.stdin.close()
-        status = self.process.wait(timeout=30)
-        error = self.process.stderr.read() if self.process.stderr else ""
-        if status and exc_type is None:
-            raise RuntimeError(f"block transform failed (exit {status}): {error}")
-
-    def __call__(self, source: bytes, work: bytes) -> bytes:
-        if len(source) != 16 or len(work) != 16:
-            raise ValueError("block-transform inputs require 16 bytes")
-        if not self.process.stdin or not self.process.stdout:
-            raise RuntimeError("block transform pipes unavailable")
-        self.process.stdin.write(f"{source.hex()} {work.hex()} {CONSTANT.hex()}\n")
-        self.process.stdin.flush()
-        line = self.process.stdout.readline()
-        if not line:
-            error = self.process.stderr.read() if self.process.stderr else ""
-            raise RuntimeError(f"block transform exited early: {error}")
-        output = bytes.fromhex(line.strip())
-        if len(output) != 16:
-            raise ValueError("block-transform output has wrong length")
-        return output
+def block_transform(source: bytes, work: bytes) -> bytes:
+    """AES-128-ECB encrypt of ``source ^ CONSTANT`` under ``work ^ WORK_MASK``."""
+    if len(source) != 16 or len(work) != 16:
+        raise ValueError("block-transform inputs require 16 bytes")
+    op = Cipher(algorithms.AES(_xor(work, WORK_MASK)), modes.ECB()).encryptor()
+    return op.update(_xor(source, CONSTANT)) + op.finalize()
 
 
-def derive_page_key(
-    wrapped: bytes, absolute_index: int, work: bytes, block: BlockTransform
-) -> bytes:
-    a, b, c = (block(source, work) for source in source_blocks(wrapped, absolute_index))
+def derive_page_key(wrapped: bytes, absolute_index: int, work: bytes) -> bytes:
+    a, b, c = (block_transform(s, work) for s in source_blocks(wrapped, absolute_index))
     return finish(_xor(finish(_xor(finish(a), b)), c))
 
 
 def decrypt_binary(
-    source: bytes, sinf: bytes, supf: bytes, credential: bytes, block: BlockTransform
+    source: bytes, sinf: bytes, supf: bytes, credential: bytes
 ) -> tuple[bytes, int]:
     info = arm64_encryption_info(source)
     page_count = info.cryptsize // PAGE_SIZE
@@ -301,7 +260,7 @@ def decrypt_binary(
         if len(record) != 32:
             raise ValueError("truncated SUPF page record")
         absolute_index = (info.base + info.cryptoff) // PAGE_SIZE + local_page
-        key = derive_page_key(record[:16], absolute_index, work, block)
+        key = derive_page_key(record[:16], absolute_index, work)
         start = info.base + info.cryptoff + PAGE_SIZE * local_page
         ciphertext = source[start : start + PAGE_SIZE]
         op = Cipher(algorithms.AES(key), modes.CBC(record[16:32])).decryptor()
