@@ -29,6 +29,12 @@ ROUND_SELECTORS = tuple(
 ROUND_CONSTANTS = (0x6EE6B74F, 0x78B72ABF, 0xD227C8EA, 0x0C0081BC)
 FINAL_SELECTORS = ((0, 1, 2, 3), (0, 2, 4, 6), (0, 3, 5, 7), (4, 5, 6, 7))
 FINAL_WORDS = (0x85FE4668, 0x15EA8FCD, 0x3A17569B, 0x216E68E0)
+_FINAL_CONSTANTS = (
+    0x4F3DAC1FD3361949,
+    0x4F3DAC1F631A63A2,
+    0x4F3DAC1F87CD2974,
+    0x4F3DAC1F7EA63AB1,
+)
 
 
 @dataclass(frozen=True)
@@ -174,26 +180,7 @@ def arm64_supf_record_offset(supf: bytes, required_pages: int) -> int:
 
 
 def _high8_from_context_word(word: int) -> bytes:
-    b = word.to_bytes(8, "little")
-
-    def fold(value: int, mask: int) -> int:
-        mixed = value ^ mask
-        return (mixed - (0x5A & (mixed << 1)) + 0x2D) & 255
-
-    q = b[1] ^ 0xA1
-    seventh = (q - 2 * ((b[1] & 0x52) ^ q) + 0x2D) & 255
-    return bytes(
-        (
-            fold(b[7], 0x3E) ^ 0x3E,
-            fold(b[6], 0x4A) ^ 0x24,
-            fold(b[5], 0x45) ^ 0x93,
-            fold(b[4], 0xB6) ^ 0x6D,
-            fold(b[3], 0x64) ^ 0xA4,
-            fold(b[2], 0xEB) ^ 0xDD,
-            seventh ^ 0x04,
-            (b[0] ^ 0x6C) ^ 0x5F,
-        )
-    )
+    return (word ^ 0x2D43FBF6ED1B8833).to_bytes(8, "big")
 
 
 def source_blocks(wrapped: bytes, absolute_index: int) -> tuple[bytes, bytes, bytes]:
@@ -215,12 +202,9 @@ def _mix_round(before: list[int], selectors: bytes) -> list[int]:
         b = before[selectors[pair * 2 + 1] - 0x36] ^ 0x18FB
         mixed = a + b
         square = (mixed * mixed ^ ROUND_CONSTANTS[pair]) & MASK32
-        high = (mixed >> 16) & 0xFFFF
-        low = ((0xCB61 - high * high) ^ square) & 0xFFFF
-        top = (square >> 16) & 0xFFFF
-        coded = top ^ 0x6B2
+        low = ((0xCB61 - ((mixed >> 16) & 0xFFFF) ** 2) ^ square) & 0xFFFF
         out.append(low ^ 0x18FB)
-        out.append((coded - 2 * ((coded & 0x58FF) ^ (top & 0x4004)) + 0x18FB) & 0xFFFF)
+        out.append((square >> 16) ^ 0x1E49)
     return out
 
 
@@ -238,20 +222,12 @@ def finish(state: bytes) -> bytes:
         decoded = [row[i] ^ 0x18FB for i in selectors]
         left = decoded[0] | decoded[1] << 16
         right = decoded[2] | decoded[3] << 16
-        x9 = left + right
-        x19 = ((x9 & MASK32) ^ 0x9CFD58B3DE3FD77F) & MASK64
-        x9 = (((x9 << 1) & 0x1BC7FAEFE) + x19 + 0x6302A74C21C02881) & MASK64
-        x9 = (x9 * x9) & MASK64
-        x19 = (x9 << 1) & 0x9E7B583F108F031C
-        x9 = (x9 + 0x4F3DAC1F8847818E - x19) & MASK64
-        x19 = (FINAL_WORDS[j] + 0xD573525F) & MASK32
-        x22 = (x19 << 1) & 0x00000001108F031C
-        x19 = (x19 + 0x4F3DAC1F8847818E - x22) & MASK64
-        x19 ^= x9
+        x9 = ((left + right) & MASK32) ** 2 & MASK64
+        x9 ^= 0x4F3DAC1F8847818E
+        x19 = _FINAL_CONSTANTS[j] ^ x9
         x9 = x19 ^ (x9 >> 32)
         low = (x9 ^ 0xB4E4) & 0xFFFF
-        high = ((x9 >> 16) ^ 0x4F3D) & MASK32
-        high = (high - ((high << 1) & 0x31F6) + 0x18FB) & 0xFFFF
+        high = ((x9 >> 16) ^ 0x4F3D ^ 0x18FB) & 0xFFFF
         final.extend((low, high))
     return b"".join(
         (a ^ b).to_bytes(2, "big") for a, b in zip(initial, final)
